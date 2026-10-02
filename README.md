@@ -201,13 +201,16 @@ Windows版因为离线翻译argos translate需要的环境容量非常大，完�
 ### 📦 依赖项许可证
 本软件依赖于以下项目，它们各自的许可证决定了本项目必须使用 GPLv3：
 * **PyQt5**: GPL v3
-* **Argos Translate**: AGPL v3
+* **Argos Translate Python project**: MIT (see its upstream repository).
 * **Tesseract OCR**: Apache 2.0
 * (以及其他 Python 库各自的许可证...)
 
 
-### 💻 AI 开发说明
-本项目使用 AI 工具 (DeepSeek 和 Claude 4) 辅助开发。GPLv3 许可证适用于项目中体现了作者（Jt Liaw）创造性劳动的整体作品。
+### 上游来源与模型许可
+
+本仓库是 [Skylark Screen Translator](https://github.com/jtliaw/Skylark-Screen-Translator) 的衍生项目，保留其 GPL-3.0 许可及源码原有的版权声明；此版本新增 Windows 自动屏幕监控和离线英译中模式。分发或修改本仓库时，应保留适用的上游版权与许可证通知，并遵守 GPLv3 对衍生作品的要求。
+
+PyQt5 按 GPL v3 提供；Tesseract OCR 按 Apache-2.0 提供，作为独立系统软件安装而不随本仓库打包。Argos 英译中模型是单独下载、安装的组件，不随仓库分发；其许可应以具体模型自带的元数据和许可文件为准。其他 Python 依赖也各自受其附带许可约束。将软件或依赖重新分发前，请检查实际使用版本的许可和通知。本说明不构成法律意见。
 ---
 <div align="center">
 
