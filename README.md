@@ -5,9 +5,24 @@
 This fork adds an offline automatic mode in `auto_mode.py`. It monitors all
 connected displays when launched, runs local Tesseract OCR only after a visible
 screen change, and translates English text to Chinese with local Argos
-models. It does not call online translation services. The overlay is
-borderless, translucent, always on top, draggable from its header, and has a
-Pause/Resume button. Use the mouse wheel over the overlay to adjust opacity.
+models. It does not call online translation services. Each translated line is
+shown over its matching English line in a readable, near-opaque label, so the
+Chinese occupies the source text's location instead of appearing separately
+below it. Each label keeps the recognized English paragraph in smaller text
+under the Chinese translation, making the source-to-translation match explicit.
+Labels are reused between screen scans and excluded from OCR and change
+detection to reduce flicker. Empty OCR scans do not clear existing labels.
+The overlay is click-through and does not cover the screen with a fixed control
+panel.
+Adjacent OCR lines in the same paragraph are translated together for context.
+Unlike a browser's built-in page translation, a desktop OCR overlay cannot
+change the underlying webpage DOM or reflow its layout; it covers the source
+paragraph at its original screen position.
+
+To pause/resume translation, right-click the app icon in the Windows
+notification area and select **暂停翻译** or **继续翻译**. If the tray icon is
+hidden, click the up-arrow beside the notification area icons. Use **退出** in
+the same menu to close the app.
 
 ### Windows setup
 
@@ -25,9 +40,8 @@ Pause/Resume button. Use the mouse wheel over the overlay to adjust opacity.
 
 The one-time model setup downloads the open Argos English-to-Chinese language
 package from its public index; runtime screen capture, OCR, and translation
-are local. The default monitor checks for changes every 0.7 seconds. The
-overlay itself is excluded from OCR and change detection. Closing the overlay
-stops the monitor.
+are local. The default monitor checks for changes every 0.7 seconds. Existing
+translation labels are excluded from OCR and change detection.
 
 <div align="center">
 

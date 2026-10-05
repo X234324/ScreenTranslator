@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,14 +21,14 @@ import mss
 import numpy as np
 import pytesseract
 from PIL import Image
-from PyQt5.QtCore import QPoint, QThread, Qt, pyqtSignal
-from PyQt5.QtGui import QGuiApplication
+from PyQt5.QtCore import QThread, Qt, pyqtSignal
+from PyQt5.QtGui import QGuiApplication, QIcon
 from PyQt5.QtWidgets import (
+    QAction,
     QApplication,
-    QHBoxLayout,
     QLabel,
-    QPushButton,
-    QVBoxLayout,
+    QMenu,
+    QSystemTrayIcon,
     QWidget,
 )
 
@@ -43,6 +45,16 @@ class ScreenBounds:
     top: int
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class TextRegion:
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    translation: str = ""
 
 
 def find_tesseract() -> str | None:
@@ -67,6 +79,59 @@ def find_tesseract() -> str | None:
     )
 
 
+def extract_text_regions(
+    data: dict[str, list], left: int = 0, top: int = 0
+) -> list[TextRegion]:
+    paragraphs: dict[
+        tuple[str, str, str], list[tuple[str, int, int, int, int, str]]
+    ] = {}
+    text_count = len(data.get("text", []))
+    for index, raw_text in enumerate(data.get("text", [])):
+        text = " ".join(str(raw_text).encode("ascii", errors="replace").decode("ascii").split())
+        if len(text) < 2 or not re.search(r"[A-Za-z]", text):
+            continue
+        try:
+            if float(data["conf"][index]) < 35:
+                continue
+            x = int(data["left"][index])
+            y = int(data["top"][index])
+            width = int(data["width"][index])
+            height = int(data["height"][index])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        paragraph_key = tuple(
+            str(data.get(field, [""] * text_count)[index])
+            for field in ("block_num", "par_num", "page_num")
+        )
+        line_key = str(data.get("line_num", [""] * text_count)[index])
+        paragraphs.setdefault(paragraph_key, []).append(
+            (text, x, y, width, height, line_key)
+        )
+
+    regions: list[TextRegion] = []
+    for words in paragraphs.values():
+        lines: dict[str, list[tuple[str, int, int, int, int]]] = {}
+        for word, x, y, width, height, line_key in words:
+            lines.setdefault(line_key, []).append((word, x, y, width, height))
+        ordered_lines = sorted(
+            lines.values(),
+            key=lambda line: min(word[2] for word in line),
+        )
+        line_texts = []
+        for line in ordered_lines:
+            line.sort(key=lambda word: word[1])
+            line_texts.append(" ".join(word[0] for word in line))
+        text = " ".join(line_texts)
+        if len(text) < 3:
+            continue
+        x1 = min(word[1] for word in words)
+        y1 = min(word[2] for word in words)
+        x2 = max(word[1] + word[3] for word in words)
+        y2 = max(word[2] + word[4] for word in words)
+        regions.append(TextRegion(text, left + x1, top + y1, x2 - x1, y2 - y1))
+    return sorted(regions, key=lambda region: (region.top, region.left))
+
+
 def screen_changed(previous: np.ndarray | None, current: np.ndarray) -> bool:
     if previous is None or previous.shape != current.shape:
         return True
@@ -75,6 +140,10 @@ def screen_changed(previous: np.ndarray | None, current: np.ndarray) -> bool:
         difference, PIXEL_THRESHOLD, 255, cv2.THRESH_BINARY
     )[1])
     return changed_pixels / difference.size >= CHANGE_THRESHOLD
+
+
+def screen_preview(frame: np.ndarray) -> np.ndarray:
+    return cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
 
 
 def text_key(text: str, source: str, target: str = "zh") -> str:
@@ -167,7 +236,7 @@ class TranslationClient:
 
 
 class MonitorThread(QThread):
-    translated = pyqtSignal(str)
+    translated = pyqtSignal(object)
     status = pyqtSignal(str)
     failed = pyqtSignal(str)
     active_changed = pyqtSignal(bool)
@@ -175,11 +244,11 @@ class MonitorThread(QThread):
     def __init__(
         self,
         bounds: ScreenBounds,
-        overlay_geometry: Callable[[], tuple[int, int, int, int]],
+        overlay_regions: Callable[[], tuple[TextRegion, ...]],
     ) -> None:
         super().__init__()
         self.bounds = bounds
-        self.overlay_geometry = overlay_geometry
+        self.overlay_regions = overlay_regions
         self._active = threading.Event()
         self._active.set()
         self._poll_wake = threading.Event()
@@ -193,15 +262,15 @@ class MonitorThread(QThread):
             self._active.clear()
         self._poll_wake.set()
         self.active_changed.emit(active)
-        self.status.emit("Monitoring screen…" if active else "Paused")
+        self.status.emit("正在监控屏幕…" if active else "已暂停")
 
     def run(self) -> None:
         try:
             tesseract = find_tesseract()
             if not tesseract:
                 raise RuntimeError(
-                    "Tesseract was not found. Install Tesseract OCR with English "
-                    "language data, or set TESSERACT_CMD to tesseract.exe."
+                    "未找到 Tesseract。请安装带英文数据的 Tesseract OCR，"
+                    "或设置 TESSERACT_CMD 为 tesseract.exe 的完整路径。"
                 )
             pytesseract.pytesseract.tesseract_cmd = tesseract
             self._translator = TranslationClient()
@@ -210,7 +279,7 @@ class MonitorThread(QThread):
             return
 
         previous: np.ndarray | None = None
-        self.status.emit("Monitoring screen…")
+        self.status.emit("正在监控屏幕…")
         try:
             with mss.MSS() as capture:
                 monitor = capture.monitors[0]
@@ -220,17 +289,31 @@ class MonitorThread(QThread):
                     if self.isInterruptionRequested():
                         break
                     frame = np.asarray(capture.grab(monitor))
-                    frame = self._exclude_overlay(frame, monitor)
+                    frame = self._exclude_translations(frame, monitor)
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-                    preview = cv2.resize(gray, (320, 180), interpolation=cv2.INTER_AREA)
-                    if screen_changed(previous, preview):
-                        previous = preview
-                        text = pytesseract.image_to_string(
+                    preview = screen_preview(gray)
+                    comparison_previous = None
+                    if previous is not None:
+                        comparison_previous = screen_preview(
+                            self._exclude_translations(previous.copy(), monitor)
+                        )
+                    previous = gray
+                    if screen_changed(comparison_previous, preview):
+                        data = pytesseract.image_to_data(
                             Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)),
                             lang="eng",
                             config="--oem 3 --psm 11",
-                        ).strip()
-                        self._translate_if_new(text)
+                            output_type=pytesseract.Output.DICT,
+                        )
+                        regions = extract_text_regions(
+                            data,
+                            monitor["left"],
+                            monitor["top"],
+                        )
+                        if regions:
+                            self._translate_regions(regions)
+                    else:
+                        previous = gray
                     self._poll_wake.clear()
                     if self._active.is_set() and not self.isInterruptionRequested():
                         self._poll_wake.wait(timeout=POLL_INTERVAL_SECONDS)
@@ -240,111 +323,167 @@ class MonitorThread(QThread):
             if self._translator is not None:
                 self._translator.close()
 
-    def _exclude_overlay(self, frame: np.ndarray, monitor: dict[str, int]) -> np.ndarray:
-        left, top, width, height = self.overlay_geometry()
-        scale_x = frame.shape[1] / self.bounds.width
-        scale_y = frame.shape[0] / self.bounds.height
-        x1 = max(0, round((left - self.bounds.left - monitor["left"]) * scale_x))
-        y1 = max(0, round((top - self.bounds.top - monitor["top"]) * scale_y))
-        x2 = min(frame.shape[1], round(x1 + width * scale_x))
-        y2 = min(frame.shape[0], round(y1 + height * scale_y))
-        if x2 > x1 and y2 > y1:
-            frame[y1:y2, x1:x2] = 255
+    def _exclude_translations(self, frame: np.ndarray, monitor: dict[str, int]) -> np.ndarray:
+        scale_x = frame.shape[1] / monitor["width"]
+        scale_y = frame.shape[0] / monitor["height"]
+        for region in self.overlay_regions():
+            x1 = max(0, round((region.left - monitor["left"]) * scale_x))
+            y1 = max(0, round((region.top - monitor["top"]) * scale_y))
+            x2 = min(
+                frame.shape[1],
+                round((region.left + region.width - monitor["left"]) * scale_x),
+            )
+            y2 = min(
+                frame.shape[0],
+                round((region.top + region.height - monitor["top"]) * scale_y),
+            )
+            if x2 > x1 and y2 > y1:
+                frame[y1:y2, x1:x2] = 255
         return frame
 
-    def _translate_if_new(self, text: str) -> None:
-        normalized = " ".join(text.encode("ascii", errors="replace").decode("ascii").split())
-        if len(normalized) < 3:
+    def _translate_regions(self, regions: list[TextRegion]) -> None:
+        if not regions:
             return
-        key = text_key(normalized, "auto")
-        if key in self._text_cache:
-            self._text_cache.move_to_end(key)
-            return
+
+        translated_regions: list[TextRegion] = []
         try:
-            assert self._translator is not None
-            translated = self._translator.translate(normalized)
-            self._text_cache[key] = None
-            if len(self._text_cache) > MAX_TRANSLATION_CACHE:
-                self._text_cache.popitem(last=False)
-            self.translated.emit(translated)
+            for region in regions:
+                key = text_key(region.text, "en")
+                if key in self._text_cache:
+                    translation = self._text_cache[key]
+                    self._text_cache.move_to_end(key)
+                else:
+                    assert self._translator is not None
+                    translation = self._translator.translate(region.text)
+                    self._text_cache[key] = translation
+                    if len(self._text_cache) > MAX_TRANSLATION_CACHE:
+                        self._text_cache.popitem(last=False)
+                translated_regions.append(
+                    TextRegion(
+                        region.text,
+                        region.left,
+                        region.top,
+                        region.width,
+                        region.height,
+                        translation,
+                    )
+                )
+            self.translated.emit(translated_regions)
         except Exception as error:
             self.failed.emit(f"Translation failed: {error}")
 
 
-class Overlay(QWidget):
+class TranslationOverlay(QWidget):
     def __init__(self, bounds: ScreenBounds) -> None:
         super().__init__(
             None,
-            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowTransparentForInput
+            | Qt.WindowDoesNotAcceptFocus,
         )
         self.bounds = bounds
-        self._drag_offset: QPoint | None = None
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowOpacity(0.92)
-        self.setMinimumSize(360, 150)
-        self.resize(500, 220)
-        self.move(bounds.left + 40, bounds.top + 80)
-
-        self.toggle_button = QPushButton("Pause")
-        self.toggle_button.setFixedWidth(86)
-        self.close_button = QPushButton("×")
-        self.close_button.setFixedWidth(28)
-        self.output = QLabel("Starting automatic screen monitoring…")
-        self.output.setWordWrap(True)
-        self.output.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.output.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.output.setStyleSheet("color: white; font-size: 16px;")
-        self.state = QLabel("Starting…")
-        self.state.setStyleSheet("color: #cbd5e1;")
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("Screen Translator"))
-        header.addStretch(1)
-        header.addWidget(self.state)
-        header.addWidget(self.toggle_button)
-        header.addWidget(self.close_button)
-        layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(self.output, 1)
+        self.setGeometry(bounds.left, bounds.top, bounds.width, bounds.height)
+        self._labels: dict[str, QLabel] = {}
+        self._regions: tuple[TextRegion, ...] = ()
         self.setStyleSheet(
-            "Overlay { background-color: rgba(20, 24, 34, 220);"
-            "border: 1px solid rgba(255,255,255,90); border-radius: 10px; }"
-            "QPushButton { color: white; background: #315fba; padding: 6px;"
-            "border-radius: 5px; }"
+            "QLabel { color: #202124; background-color: rgba(255, 255, 255, 250);"
+            "border: 0; border-radius: 2px;"
+            "padding: 1px 2px; font-size: 15px; font-weight: 400; }"
         )
 
-    def geometry_tuple(self) -> tuple[int, int, int, int]:
-        rect = self.geometry()
-        return rect.x(), rect.y(), rect.width(), rect.height()
+    def mask_regions(self) -> tuple[TextRegion, ...]:
+        return self._regions
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton and event.pos().y() < 48:
-            self._drag_offset = event.globalPos() - self.frameGeometry().topLeft()
-            event.accept()
+    def set_translations(self, regions: list[TextRegion]) -> None:
+        if not regions:
             return
-        super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event) -> None:
-        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPos() - self._drag_offset)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
+        active_labels: set[str] = set()
+        label_regions: list[TextRegion] = []
+        occurrences: dict[str, int] = {}
+        screen_right = self.bounds.left + self.bounds.width
+        screen_bottom = self.bounds.top + self.bounds.height
 
-    def mouseReleaseEvent(self, event) -> None:
-        self._drag_offset = None
-        super().mouseReleaseEvent(event)
+        for region in regions:
+            if not region.translation.strip() or region.width < 1:
+                continue
 
-    def wheelEvent(self, event) -> None:
-        delta = 0.05 if event.angleDelta().y() > 0 else -0.05
-        self.setWindowOpacity(min(1.0, max(0.3, self.windowOpacity() + delta)))
-        event.accept()
+            base_key = text_key(region.text, "en")
+            occurrence = occurrences.get(base_key, 0)
+            occurrences[base_key] = occurrence + 1
+            key = f"{base_key}:{occurrence}"
+            active_labels.add(key)
+            label = self._labels.get(key)
+            if label is None:
+                label = QLabel(self)
+                self._labels[key] = label
+            label.setWordWrap(True)
+            label.setTextFormat(Qt.RichText)
+            label.setTextInteractionFlags(Qt.NoTextInteraction)
+            label_text = (
+                f"<div>{html.escape(region.translation)}</div>"
+                f'<div style="color:#5f6368;font-size:11px;">'
+                f"{html.escape(region.text)}</div>"
+            )
+            if label.text() != label_text:
+                label.setText(label_text)
 
-    def closeEvent(self, event) -> None:
-        self.close_requested.emit()
-        super().closeEvent(event)
+            x = min(max(self.bounds.left, region.left), screen_right - 1)
+            y = min(max(self.bounds.top, region.top), screen_bottom - 1)
+            width = min(region.width, screen_right - x)
+            label.setFixedWidth(width)
+            height = max(region.height, label.heightForWidth(width) + 4)
+            height = min(height, screen_bottom - y)
+            label.setFixedHeight(height)
+            label.move(x - self.bounds.left, y - self.bounds.top)
+            label.show()
+            label_regions.append(
+                TextRegion(
+                    region.text,
+                    x,
+                    y,
+                    width,
+                    height,
+                    region.translation,
+                )
+            )
 
-    close_requested = pyqtSignal()
+        for key, label in self._labels.items():
+            if key not in active_labels:
+                label.hide()
+        self._regions = tuple(label_regions)
+
+
+class TrayControls:
+    def __init__(self, app: QApplication, monitor: MonitorThread) -> None:
+        self.monitor = monitor
+        self.tray = QSystemTrayIcon(QIcon(str(Path(__file__).with_name("skylark.ico"))))
+        self.tray.setToolTip("实时屏幕翻译：正在监控屏幕")
+        menu = QMenu()
+        self.toggle_action = QAction("暂停翻译", menu)
+        self.toggle_action.triggered.connect(self.toggle)
+        menu.addAction(self.toggle_action)
+        menu.addSeparator()
+        exit_action = QAction("退出", menu)
+        exit_action.triggered.connect(app.quit)
+        menu.addAction(exit_action)
+        self.tray.setContextMenu(menu)
+        monitor.active_changed.connect(self.update_active)
+        monitor.status.connect(self.tray.setToolTip)
+        monitor.failed.connect(self.show_error)
+        self.tray.show()
+
+    def toggle(self) -> None:
+        self.monitor.set_active(not self.monitor._active.is_set())
+
+    def update_active(self, active: bool) -> None:
+        self.toggle_action.setText("暂停翻译" if active else "继续翻译")
+
+    def show_error(self, message: str) -> None:
+        self.tray.showMessage("实时屏幕翻译", message)
 
 
 def virtual_screen_bounds() -> ScreenBounds:
@@ -358,26 +497,18 @@ def virtual_screen_bounds() -> ScreenBounds:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     bounds = virtual_screen_bounds()
-    overlay = Overlay(bounds)
-    monitor = MonitorThread(bounds, overlay.geometry_tuple)
-    overlay.toggle_button.clicked.connect(
-        lambda: monitor.set_active(not monitor._active.is_set())
-    )
-    monitor.active_changed.connect(
-        lambda active: overlay.toggle_button.setText("Pause" if active else "Resume")
-    )
-    monitor.translated.connect(overlay.output.setText)
-    monitor.status.connect(overlay.state.setText)
-    monitor.failed.connect(overlay.output.setText)
-    overlay.close_button.clicked.connect(overlay.close)
-    overlay.close_requested.connect(monitor.requestInterruption)
-    overlay.close_requested.connect(monitor.quit)
+    overlay = TranslationOverlay(bounds)
+    monitor = MonitorThread(bounds, overlay.mask_regions)
+    tray = TrayControls(app, monitor)
+    monitor.translated.connect(overlay.set_translations)
     overlay.show()
     monitor.start()
     app.aboutToQuit.connect(monitor.requestInterruption)
     app.aboutToQuit.connect(monitor.quit)
     app.aboutToQuit.connect(lambda: monitor.wait(3000))
+    app.aboutToQuit.connect(tray.tray.hide)
     return app.exec_()
 
 
